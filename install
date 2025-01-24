@@ -1,0 +1,164 @@
+#!/bin/bash
+
+# Выводим список всех доступных дисков
+#echo "Доступные диски:"
+#lsblk
+
+# Запрашиваем у пользователя выбор диска
+#read -p "Введите диск (например, /dev/sda): " disk
+
+echo "Input root password"
+read -s root_password
+
+echo "Input user password"
+read -s user_password
+
+
+# Проверяем, существует ли указанный диск
+# if [ ! -b "$disk" ]; then
+#  echo "Ошибка: диск $disk не найден."
+#  exit 1
+#fi
+
+# Выполнение команд parted для выбранного диска
+parted /dev/sda --script mklabel gpt
+parted /dev/sda --script mkpart ESP fat32 1MiB 512MiB
+parted /dev/sda --script set 1 boot on
+parted /dev/sda --script mkpart primary 513MiB 100%
+
+echo "Шифруем раздел $disk..."
+cryptsetup luksFormat /dev/sda2 --batch-mode
+
+# Вводим пароль вручную для открытия зашифрованного раздела
+echo "Открываем зашифрованный раздел..."
+cryptsetup open /dev/sda2 luks
+
+# Проверяем доступные устройства в /dev/mapper/
+echo "Проверяем доступные устройства в /dev/mapper/:"
+ls /dev/mapper/*
+
+# Создаем физический том (PV) на зашифрованном разделе
+echo "Создаем физический том (PV) на /dev/mapper/luks..."
+pvcreate /dev/mapper/luks
+
+# Создаем группу томов (VG) main
+echo "Создаем группу томов main..."
+vgcreate main /dev/mapper/luks
+
+# Создаем логический том (LV) root, используя все пространство
+echo "Создаем логический том root..."
+lvcreate -l 100%FREE main -n root
+
+# Показываем все логические разделы
+echo "Все логические разделы:"
+lvs
+
+echo "Форматируем раздел $disk-part2 под ext4..."
+mkfs.ext4 /dev/mapper/main-root
+
+# Форматируем boot раздел под Fat32 (на /dev/sda1)
+echo "Форматируем раздел ${disk}1 под FAT32..."
+mkfs.fat -F 32 /dev/sda1
+
+# Монтируем разделы для установки системы
+echo "Монтируем раздел ${disk}2 на /mnt..."
+mount /dev/mapper/main-root /mnt
+
+# Создаем директорию для монтирования boot
+echo "Создаем директорию /mnt/boot..."
+mkdir /mnt/boot
+
+# Монтируем раздел с boot в /mnt/boot
+echo "Монтируем раздел ${disk}1 на /mnt/boot..."
+mount /dev/sda1 /mnt/boot
+
+# Устанавливаем базовые софты
+echo "Устанавливаем базовые пакеты..."
+pacstrap -K /mnt base linux linux-firmware base-devel lvm2
+
+# Устанавливаем дополнительные пакеты
+echo "Устанавливаем дополнительные пакеты..."
+pacstrap /mnt dhcpcd net-tools iproute2 networkmanager vim micro efibootmgr iwd
+
+# Генерируем fstab
+echo "Генерируем fstab..."
+genfstab -U /mnt >> /mnt/etc/fstab
+cat /mnt/etc/fstab
+
+# Настройка системы через arch-chroot
+echo "Настройка системы через arch-chroot..."
+arch-chroot /mnt <<EOF
+
+# Раскомментируем строки для локалей ru_RU и en_US
+echo "Раскомментируем локали ru_RU.UTF-8 и en_US.UTF-8 в /etc/locale.gen..."
+sed -i 's/#ru_RU.UTF-8 UTF-8/ru_RU.UTF-8 UTF-8/' /etc/locale.gen
+sed -i 's/#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+
+# Генерируем локали
+echo "Генерируем локали..."
+locale-gen
+
+# Настроим время
+echo "Настройка времени..."
+ln -sf /usr/share/zoneinfo/Europe/Moscow /etc/localtime
+hwclock --systohc
+
+# Указываем имя хоста
+echo "Указываем имя хоста..."
+echo "arch" > /etc/hostname
+
+# Устанавливаем пароль для root
+echo "root:$root_password" | chpasswd
+
+# Добавляем нового пользователя и настраиваем права
+echo "Добавляем нового пользователя user и настраиваем права..."
+useradd -m -G wheel,users,video -s /bin/bash user
+echo "user:$user_password" | chpasswd
+
+# Включаем службы dhcpcd и iwd
+echo "Включаем службы dhcpcd и iwd..."
+systemctl enable dhcpcd
+systemctl enable iwd.service
+
+echo "Настройка ядра"
+micro /etc/mkinitcpio.conf
+
+echo "Пересборка ядра"
+mkinitcpio -p linux
+
+# Устанавливаем bootloader
+echo "Устанавливаем bootloader"
+bootctl install --path=/boot
+
+# Переходим в каталог загрузчика и очищаем loader.conf, если там что-то есть
+echo "Переходим в каталог загрузчика и очищаем loader.conf, если там что-то есть"
+cd /boot/loader
+
+# Редактируем loader.conf
+echo "Редактируем loader.conf"
+echo "timeout 3" >> /boot/loader/loader.conf
+echo "default arch" >> /boot/loader/loader.conf
+
+micro /boot/loader/loader.conf
+
+# Переходим в каталог с конфигурациями загрузки и создаем arch.conf
+echo "---------------------------------------------"
+cd /boot/loader/entries
+echo "title Arch Linux" > /boot/loader/entries/arch.conf
+echo "linux /vmlinuz-linux" >> /boot/loader/entries/arch.conf
+echo "initrd /initramfs-linux.img" >> /boot/loader/entries/arch.conf
+
+# Получаем UUID для /dev/sda2, чтобы правильно указать его в опциях загрузки
+UUID=\$(blkid /dev/sda2 -o value -s UUID)
+
+# Вставляем опции для шифрования
+echo "options rw cryptdevice=UUID=\$UUID:main root=/dev/mapper/main-root" >> /boot/loader/entries/arch.conf
+
+# Открываем arch.conf для редактирования вручную
+micro /boot/loader/entries/arch.conf
+
+sudo EDITOR=micro visudo
+
+EOF
+
+echo "Процесс завершен."
