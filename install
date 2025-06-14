@@ -11,10 +11,10 @@ sudo pacman -Sy
 sudo pacman -S micro
 
 echo "Input root password"
-read -s root_password
+read root_password
 
 echo "Input user password"
-read -s user_password
+read user_password
 
 
 # Проверяем, существует ли указанный диск
